@@ -42,6 +42,44 @@ const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
+// A whole-file edit (FileViewer's Edit button) rewrites a file in place. It is
+// bounded like one upload file: a too-large edit is refused rather than
+// staged, because the only client is the in-app editor, which shows the button
+// only for whole files it already loaded.
+const MAX_WRITE_REQUEST_BYTES = MAX_UPLOAD_FILE_BYTES; // 25 MB
+// Whole-file text content is served to the editor as UTF-8 in one request.
+// Body bytes differ from UTF-16 JS string length we check on the client, so
+// the server bounds the decoded byte length (Buffer.byteLength) instead.
+const MAX_WRITE_CONTENT_BYTES = MAX_WRITE_REQUEST_BYTES; // 25 MB
+
+// The security checks a `type=write` target must pass before any byte is
+// staged: the file is inside an allowed root, its lexically-resolved name holds
+// no `..` segment, and it is an existing real file (not a directory, not a
+// symbolic link) the existing-path check also approves (which collapses `..`
+// on the filesystem side and follows links).
+function resolveWritableFile(
+  segments: string[],
+  allowedRoots: Set<string>,
+): string | null {
+  const filePath = filePathFromApiSegments(segments);
+  // A `..` inside a name authorizes lexically but resolves on the filesystem
+  // outside the roots; refused verbatim here, like the read path does.
+  if (hasParentDirectorySegment(filePath)) return null;
+  if (!isFilePathAllowed(filePath, allowedRoots)) return null;
+  if (!isExistingFilePathAllowed(filePath, allowedRoots)) return null;
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch {
+    return null;
+  }
+  // Writing redirects a symlink's target from a committed repo, and a
+  // directory cannot be edited as text. Only an existing regular file, and
+  // never a link (lstat), so `replaceUploadFile`'s own lstat guard holds.
+  if (!stat.isFile() || stat.isSymbolicLink()) return null;
+  return filePath;
+}
 
 // The source view highlights every language here but text, pdf and word with
 // the Prism grammar of that name (refractor/all); a name it lacks renders
@@ -81,6 +119,16 @@ function getLanguage(filePath: string): string {
 
 function parseFileRequestType(value: string): FileRequestType | null {
   return FILE_REQUEST_TYPE_SET.has(value) ? (value as FileRequestType) : null;
+}
+
+function writeFileContent(filePath: string, content: string): void {
+  const bytes = Buffer.from(content, "utf8");
+  if (bytes.byteLength > MAX_WRITE_CONTENT_BYTES) {
+    throw new Error("Edit is too large to write (25MB or less)");
+  }
+  // Reuses the upload writer: an atomic same-filesystem rename preserves the
+  // old file until the new one is complete, and never replaces a link or dir.
+  replaceUploadFile(filePath, bytes);
 }
 
 async function getUploadDirectory(segments: string[]): Promise<
@@ -163,6 +211,36 @@ export async function POST(
     const { path: segments } = await params;
     const type = request.nextUrl.searchParams.get("type") ?? "upload";
     if (type === "allow-link") return allowLinkedDirectory(request, segments);
+
+    // Whole-file edit: the URL names the file itself (unlike upload, which
+    // names a directory below the segments), so security runs against that exact
+    // path and the writer refuses links, directories and out-of-root files.
+    if (type === "write") {
+      if (!hasJsonContentType(request)) {
+        return NextResponse.json({ error: "Content-Type must be application/json" }, { status: 415 });
+      }
+      const body = await request.json().catch(() => null) as { content?: unknown } | null;
+      if (typeof body?.content !== "string") {
+        return NextResponse.json({ error: "content must be a string" }, { status: 400 });
+      }
+      const target = resolveWritableFile(segments, await getAllowedFileRoots());
+      if (!target) {
+        return NextResponse.json({ error: "Access denied" }, { status: 403 });
+      }
+      try {
+        writeFileContent(target, body.content);
+        const stat = fs.statSync(target);
+        return NextResponse.json({
+          size: stat.size,
+          mtime: stat.mtime.toISOString(),
+        });
+      } catch (error) {
+        return NextResponse.json(
+          { error: error instanceof Error ? error.message : String(error) },
+          { status: 400 },
+        );
+      }
+    }
 
     const uploadDirectory = await getUploadDirectory(segments);
     if ("response" in uploadDirectory) return uploadDirectory.response;

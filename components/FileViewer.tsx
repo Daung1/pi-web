@@ -153,6 +153,14 @@ function MentionIcon() {
   );
 }
 
+function EditIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+    </svg>
+  );
+}
+
 function closestSourceLine(node: Node): HTMLElement | null {
   const element = node.nodeType === Node.ELEMENT_NODE
     ? node as Element
@@ -256,7 +264,7 @@ function SourceCodeRenderer({ rows, stylesheet, useInlineStyles, wrapLines }: So
 
 function getFileApiUrl(
   filePath: string,
-  type: "read" | "download" | "meta" | "preview" | "watch",
+  type: "read" | "download" | "meta" | "preview" | "watch" | "write",
   sourceSessionId?: string | null,
   params: Record<string, string | number | undefined> = {},
 ): string {
@@ -1239,6 +1247,13 @@ function TextFileViewer({
   const [selectedLineRange, setSelectedLineRange] = useState<SelectedLineRange | null>(null);
   // Whole file for an HTML preview whose source view is still chunked.
   const [htmlFull, setHtmlFull] = useState<{ text?: string; error?: string } | null>(null);
+  // In-app whole-file editing (Edit button beside Download). Editing loads the
+  // file once as text, saves it through `POST ?type=write`, then reloads the
+  // view and the live diff. Only whole, already-loaded text files offer it.
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState<string | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   onStateChangeRef.current = onStateChange;
 
@@ -1331,6 +1346,50 @@ function TextFileViewer({
     }
   }, [cwd]);
 
+  const startEditing = useCallback(() => {
+    if (!data || data.binary || data.truncated || editing) return;
+    setEditContent(data.content);
+    setEditError(null);
+    setEditing(true);
+  }, [data, editing]);
+
+  const cancelEditing = useCallback(() => {
+    setEditing(false);
+    setEditContent(null);
+    setEditError(null);
+  }, []);
+
+  const saveEdit = useCallback(async () => {
+    if (editContent === null) return;
+    setSavingEdit(true);
+    setEditError(null);
+    try {
+      const response = await fetch(getFileApiUrl(filePath, "write", sourceSessionId), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: editContent }),
+      });
+      const body = await response.json().catch(() => ({ error: undefined })) as {
+        error?: string;
+      };
+      if (!response.ok) {
+        setEditError(body.error || "Save failed");
+        return;
+      }
+      setEditing(false);
+      setEditContent(null);
+      // Reload the viewed file and the git diff so the editor's result is what
+      // the viewer shows and the changes view reflects (the file watch media
+      // will also fire, but a reload is immediate and version-gated).
+      await fetchGitDiff(filePath);
+      await fetchContent(filePath);
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingEdit(false);
+    }
+  }, [editContent, filePath, fetchContent, fetchGitDiff, sourceSessionId]);
+
   // Reset and load the file itself when its identity changes. Live watching is
   // managed separately so pausing it never clears the displayed content.
   useEffect(() => {
@@ -1341,6 +1400,9 @@ function TextFileViewer({
     setGitDiff(null);
     setGitDiffResolved(false);
     setWatching(false);
+    setEditing(false);
+    setEditContent(null);
+    setEditError(null);
     shownVersionRef.current = null;
 
     fetchContent(filePath).finally(() => {
@@ -1675,6 +1737,10 @@ function TextFileViewer({
   const content = viewerContent;
   const markdownDirectory = getFileDirectory(filePath);
   const lines = sourceLines;
+  // A whole, already-loaded text file (never a binary, a symlink-only or a
+  // part-loaded chunk) can be edited in place. Large or CSV/TSV files keep
+  // their table/source view; binary and folder-like targets never offer it.
+  const canEdit = !isDeletedDiff && !isBinary && !!data && !data.truncated;
   const displayModes: DisplayMode[] = isDeletedDiff
     ? ["diff"]
     : [
@@ -1722,7 +1788,7 @@ function TextFileViewer({
         )}
 
         <div className="file-viewer-controls">
-          {displayModes.length > 1 && (
+          {displayModes.length > 1 && !editing && (
             <div className="file-viewer-mode-switch" aria-label={t("i18n.fileViewMode")}>
               {displayModes.map((mode) => {
                 const active = effectiveDisplayMode === mode;
@@ -1747,7 +1813,7 @@ function TextFileViewer({
           )}
 
           <div className="file-viewer-actions">
-            {(onAtMention || onMentionLines) && (
+            {(onAtMention || onMentionLines) && !editing && (
               <button
                 type="button"
                 onPointerDown={(event) => event.preventDefault()}
@@ -1773,7 +1839,7 @@ function TextFileViewer({
                 <MentionIcon />
               </button>
             )}
-            {(effectiveDisplayMode === "source" || effectiveDisplayMode === "diff") && !isBinary && (
+            {(effectiveDisplayMode === "source" || effectiveDisplayMode === "diff") && !isBinary && !editing && (
               <>
                 <button
                   type="button"
@@ -1798,7 +1864,55 @@ function TextFileViewer({
             )}
           </div>
 
-          {!isDeletedDiff && <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />}
+          {/* Edit the file in place: only a whole, already-loaded text file is
+              editable (no binary, no truncated chunk, no deleted diff). */}
+          {canEdit && !savingEdit && !editing && (
+            <button
+              type="button"
+              onClick={startEditing}
+              title={t("i18n.editFile")}
+              aria-label={t("i18n.editFile")}
+              className="file-viewer-icon-button"
+            >
+              <EditIcon />
+            </button>
+          )}
+          {canEdit && editing && (
+            <>
+              <button
+                type="button"
+                onClick={cancelEditing}
+                title={t("i18n.cancelEdit")}
+                aria-label={t("i18n.cancelEdit")}
+                disabled={savingEdit}
+                className="file-viewer-icon-button"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="15" y1="9" x2="9" y2="15" />
+                  <line x1="9" y1="9" x2="15" y2="15" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveEdit()}
+                title={t("i18n.saveFile")}
+                aria-label={t("i18n.saveFile")}
+                disabled={savingEdit}
+                className="file-viewer-icon-button"
+                style={{
+                  background: editing ? "var(--bg-selected)" : "transparent",
+                  color: "var(--text)",
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </button>
+            </>
+          )}
+
+          {!isDeletedDiff && !editing && <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />}
         </div>
       </div>
 
@@ -1842,7 +1956,58 @@ function TextFileViewer({
         }}
         style={{ flex: 1, overflow: "auto", background: "var(--bg)", paddingBottom: showLoadMore ? 48 : undefined }}
       >
-        {effectiveDisplayMode === "diff" && hasGitDiff ? (
+        {editing && editContent !== null ? (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+            {editError && (
+              <div
+                className="file-viewer-edit-error"
+                style={{
+                  padding: "6px 12px",
+                  borderBottom: "1px solid var(--border)",
+                  color: "#f87171",
+                  fontSize: 12,
+                  background: "var(--bg-panel)",
+                  flexShrink: 0,
+                }}
+              >
+                {editError}
+              </div>
+            )}
+            <textarea
+              className="file-viewer-edit-area"
+              value={editContent ?? ""}
+              onChange={(event) => setEditContent(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !savingEdit) {
+                  event.preventDefault();
+                  void saveEdit();
+                } else if (event.key === "Escape" && !savingEdit) {
+                  event.preventDefault();
+                  cancelEditing();
+                }
+              }}
+              aria-label={t("i18n.editFile")}
+              autoFocus
+              spellCheck={false}
+              style={{
+                flex: 1,
+                width: "100%",
+                border: "none",
+                outline: "none",
+                resize: "none",
+                padding: "12px 16px",
+                fontFamily: "var(--font-mono)",
+                fontWeight: "var(--font-mono-weight)",
+                fontSize: 13,
+                lineHeight: 1.6,
+                color: "var(--text)",
+                background: "var(--bg)",
+                whiteSpace: "pre",
+                overflow: "auto",
+              }}
+            />
+          </div>
+        ) : effectiveDisplayMode === "diff" && hasGitDiff ? (
           <DiffView patch={gitDiff.patch!} wrapLines={wrapLines} />
         ) : isHtml && effectiveDisplayMode === "preview" && data?.truncated && !htmlFull?.text ? (
           <div style={{ padding: 24, color: "var(--text-dim)", fontSize: 12 }}>
